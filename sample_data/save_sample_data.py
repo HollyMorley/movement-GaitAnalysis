@@ -1,48 +1,69 @@
+from dataclasses import dataclass
+from typing import List
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import cv2
 from tqdm import tqdm
 
-import misaligned_frame_matching as mfm
+import sample_data.misaligned_frame_matching as mfm
 
 '''
 ### My edited data files are not formatted in a compatible way for the movement package.
 - I have no confidence values
-- Low confidence coordinates are instead marked as NaNs
-- Coordinates are from non-continuous tracking segments (runs), i.e. with frames missing between runs
+- Low confidence coordinates are instead marked as NaNs (insufficient single cam data was available for triangulation)
+- Coordinates are from non-continuous tracking segments (separate runs), i.e. with frames missing between runs
 
-## Solution:
-- replace confidence values with median of the original confidence values (i.e. given either 2 or 3 cams were 
-used for triangulation (check confidence threshold) this should return a confidence val > pcutoff where 
-triangulation was performed and where I have a coordinate value)
-- replace NaN coordinates with (0,0,0), replicating a "not tracked" state
-- Snip and stitch runs together to create a continuous tracking sequence
+### Solution:
+- Replace confidence values with median of the original confidence values (i.e. given either 2 or 3 cams were 
+    used for triangulation (pcuotff == 0.9) this should return a median confidence val > pcutoff for data points 
+    where triangulation was performed and where I therefore have a coordinate value)
+- Replace NaN coordinates with (0,0,0), replicating a "not tracked" state
+- Snip and stitch runs together (this is actually already done, I'm just resetting the indices) to create a 
+    continuous tracking sequence
 - Snip and stitch video frames together to create a continuous video sequence matching the tracking data
-    - Note the frame drifting across cams! See code and log of matched frames
+    - Note I had some frame drifting across cams due to RAM overload so have incorporated my code to 'match' frames
+        together based on timestamps (see sample_data/misaligned_frame_matching.py)  
 
 '''
+@dataclass
+class Config:
+    cams: List[str]
+    fps: int
+    data_ext: str
+    timestamp_ext: str
+    new_scorer: str
 
-CONFIG = {
-    'cams': ['side', 'front', 'overhead'],
-    'fps': 247,
-    'data_ext': '.h5',
-    'timestamp_ext': '.csv'
-}
+CONFIG = Config(
+    cams=['side', 'front', 'overhead'],
+    fps=247,
+    data_ext='.h5',
+    timestamp_ext='.csv',
+    new_scorer= 'DLC_scorer'
+)
 
 BASE_DIR = Path(r"X:\hmorley\movement\sample_data\source_data")
 BASE_NAME = "HM_20230316_APACharExt_FAA-1035243_None"
 OUTPUT_NAME = "DLC_single-mouse_DBTravelator"
 
 class SaveSampleData:
-    def __init__(self, base_dir, base_name, output_name, config=None):
+    def __init__(
+            self,
+            base_dir: Path,
+            base_name: str,
+            output_name: str,
+            config: Config | None = None
+    ):
         self.base_dir = base_dir
         self.base_name = base_name
         self.output_name = output_name
 
         config = config or CONFIG
-        for key, value in config.items():
-            setattr(self, key, value)
+        self.cams = config.cams
+        self.fps = config.fps
+        self.data_ext = config.data_ext
+        self.timestamp_ext = config.timestamp_ext
+        self.new_scorer = config.new_scorer
 
     def create_camera_config(self, view, scorer='', key='df_with_missing') -> dict:
         """Create camera configuration dictionary."""
@@ -148,8 +169,8 @@ class SaveSampleData:
         ordered_columns = []
         for bodypart in bodyparts:
             for coord in ['x', 'y', 'z', 'likelihood']:
-                if (bodypart, coord) in data.columns:
-                    ordered_columns.append((bodypart, coord))
+                if (self.new_scorer ,bodypart, coord) in data.columns:
+                    ordered_columns.append((self.new_scorer, bodypart, coord))
 
         ordered_data = data[ordered_columns]
         return ordered_data
@@ -162,7 +183,7 @@ class SaveSampleData:
         '''
         # add DLC compatible column names
         data.columns = pd.MultiIndex.from_tuples(
-            [('DLC_scorer', bodypart, coord) for bodypart, coord in data.columns],
+            [(self.new_scorer, bodypart, coord) for bodypart, coord in data.columns],
             names=['scorer', 'bodyparts', 'coords']
         )
 
@@ -188,16 +209,16 @@ class SaveSampleData:
 
         realworld_data_with_likelihoods = self.add_in_likelihoods(realworld_data_framesonly, trimmed_likelihoods)
 
-        ordered_realworld_data = self.reorganise_3d_data_to_2d_format(realworld_data_with_likelihoods)
+        index_by_runs = self.get_indexes(realworld_data_with_likelihoods) # todo this is only getting side-wise indexes. Not taking into account the frame drifting between cams
 
-        index_by_runs = self.get_indexes(ordered_realworld_data) # todo this is only getting side-wise indexes. Not taking into account the frame drifting between cams
+        realworld_data_dlc_compat = self.make_indices_DLC_compatible(realworld_data_with_likelihoods)
 
-        new_realworld_data_dlc_compat = self.make_indices_DLC_compatible(ordered_realworld_data)
+        new_realworld_data = self.reorganise_3d_data_to_2d_format(realworld_data_dlc_compat)
 
-        return new_realworld_data_dlc_compat, index_by_runs
+        return new_realworld_data, index_by_runs
 
     def snip_and_stitch_videos(self, view, frame_indices):
-        video_file_path = self.base_dir / f"{self.base_name}_side_1.avi"
+        video_file_path = self.base_dir / f"{self.base_name}_{view}_1.avi"
 
         # load video
         vid = cv2.VideoCapture(str(video_file_path))
@@ -209,7 +230,7 @@ class SaveSampleData:
         fourcc = cv2.VideoWriter_fourcc(*'MJPG') # MPEG-4 codec
 
         # Create output video writer
-        output_path = self.base_dir / f"{self.output_name}_sideview.avi"
+        output_path = self.base_dir / f"{self.output_name}_{view}view.avi"
         out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
         print('Starting to save snipped and stitched video file...')
@@ -226,6 +247,15 @@ class SaveSampleData:
         out.release()
         print('Finished!')
 
+    def trim_single_cam_data(self, new_index, data_files) -> dict:
+        single_cam_sample_data = dict(keys=self.cams)
+        for cam in self.cams:
+            data = data_files[cam]
+            data_trimmed = data.loc(axis=0)[new_index]
+            single_cam_sample_data[cam] = data_trimmed
+
+        return single_cam_sample_data
+
     def save_sample_data(self):
         # Get data and tidy format
         sample_filename, original_data = self.get_files_and_paths()
@@ -235,6 +265,7 @@ class SaveSampleData:
         # and add to realworld data
         sample_data, sample_data_index = self.add_timestamps_to_realworld_data(sample_filename, original_data)
 
+        # Save sample realworld (3D) data
         savepath = self.base_dir / f"{self.output_name}_3D.h5"
         sample_data.to_hdf(savepath,
                            key='df_with_missing',
@@ -242,12 +273,19 @@ class SaveSampleData:
         print(f"Saved sample data to {savepath}")
 
         # Trim individual cam data to match
+        single_cam_sample_data = self.trim_single_cam_data(sample_data_index, original_data)
 
+        # Save sample single cam data
+        for cam in self.cams:
+            savepath = self.base_dir / f"{self.output_name}_{cam}.h5"
+            single_cam_sample_data[cam].to_hdf(savepath,
+                                               key='df_with_missing',
+                                               mode='w')
+            print(f"Saved '{cam} cam' sample data to {savepath}")
 
         # snip and stitch the video file to match the frames in data file
         for cam in ['side']: # todo (see self.add_timestamps_to_realworld_data) only getting 'side' for now due to frame drift issue
             self.snip_and_stitch_videos(cam, sample_data_index)
-
 
 
 def main():
